@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="320" height="80" role="img" aria-label="LANLink">
+<rect width="320" height="80" fill="#FFFFFF"/>
+<g transform="translate(8 8)">
+  <circle cx="18" cy="32" r="6" fill="none" stroke="#2563EB" stroke-width="3"/>
+  <circle cx="46" cy="32" r="6" fill="none" stroke="#60A5FA" stroke-width="3"/>
+  <path d="M27 32 L37 32" stroke="#2563EB" stroke-width="3" stroke-linecap="round"/>
+  <path d="M35 29 L38 32 L35 35" fill="none" stroke="#2563EB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M29 29 L26 32 L29 35" fill="none" stroke="#2563EB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-weight="700" font-size="34" letter-spacing="-1.2">
+  <text x="86" y="52" fill="#0B1220">LAN<tspan fill="#2563EB" font-weight="600">Link</tspan></text>
+</g>
+</svg>
