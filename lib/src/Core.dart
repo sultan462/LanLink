@@ -169,7 +169,17 @@ class Core {
     if (!await file.exists()) {
       throw FileSystemException('File not found', filePath);
     }
-    await Process.start('open', [filePath]);
+    if (Platform.isMacOS) {
+      await Process.start('open', [filePath]);
+    } else if (Platform.isLinux) {
+      await Process.start('xdg-open', [filePath]);
+    } else if (Platform.isWindows) {
+      // rundll32 is a real exe, so the path is passed as a clean argv entry —
+      // no cmd.exe re-quoting to break on names with spaces/dots (e.g. "9. Learning.pdf").
+      await Process.start('rundll32', ['url.dll,FileProtocolHandler', filePath]);
+    } else {
+      throw UnsupportedError('Opening files is not supported on this platform.');
+    }
   }
 
   //10- delete a received file
