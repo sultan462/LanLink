@@ -3,6 +3,7 @@ class Device {
   id; // mDNS service name — stable identity across found/resolved/lost
   final String name; // human-readable label for the list
   final String host; // resolved IP — ready for Socket.connect / connectToDevice
+  final List<String> addresses;
   final int port; // resolved port
 
   const Device({
@@ -10,5 +11,6 @@ class Device {
     required this.name,
     required this.host,
     required this.port,
+    this.addresses = const [],
   });
 }

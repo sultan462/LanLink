@@ -6,7 +6,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:lan_link/src/model/Device.dart';
 import 'package:lan_link/src/model/ReceiveStatus.dart';
 import 'package:lan_link/src/features/client.dart';
-import 'package:lan_link/src/features/server.dart';
+import 'package:lan_link/src/features/discovery_addresses.dart';
+import 'package:lan_link/src/features/file_opener.dart';
+import 'package:lan_link/src/features/receiver_lifecycle.dart';
 
 export 'package:lan_link/src/model/ReceiveStatus.dart';
 
@@ -16,8 +18,10 @@ const String kServiceType =
 class Core {
   //main lanlink features
   //some features will be called from features folder and for some simple features will be implemented here
-  TransferServer? _server;
-  BonsoirBroadcast? _broadcast;
+  final ReceiverLifecycle _receiver = ReceiverLifecycle(
+    serviceType: kServiceType,
+  );
+  final Map<String, Device> _discoveredDevices = {};
   TransferClient client = TransferClient(
     host: '',
   ); //this will be used to connect to a device on the LAN
@@ -29,30 +33,31 @@ class Core {
     final discovery = BonsoirDiscovery(type: type);
     await discovery.initialize();
 
-    final Map<String, Device> found =
-        {}; // source of truth, keyed by service name
+    final found = _discoveredDevices;
+    found.clear();
     final controller = StreamController<List<Device>>();
 
     discovery.eventStream!.listen((event) {
       switch (event) {
         case BonsoirDiscoveryServiceFoundEvent():
-          event.service!.resolve(
+          event.service.resolve(
             discovery.serviceResolver,
           ); // found != has-address yet
         case BonsoirDiscoveryServiceResolvedEvent():
-          final s = event.service!;
-          final host = s.hostAddresses?.first;
-          if (host != null) {
+          final s = event.service;
+          final addresses = compatibleDiscoveryAddresses(s.hostAddresses);
+          if (addresses.isNotEmpty) {
             found[s.name] = Device(
               id: s.name,
               name: s.name,
-              host: host,
+              host: addresses.first,
               port: s.port,
+              addresses: addresses,
             );
             controller.add(found.values.toList());
           }
         case BonsoirDiscoveryServiceLostEvent():
-          found.remove(event.service!.name);
+          found.remove(event.service.name);
           controller.add(found.values.toList());
         default:
           break;
@@ -68,8 +73,14 @@ class Core {
   //2-connect to a device on the LAN
   Future<void> connectToDevice(String ip) async {
     //this function will connect to a device on the LAN using its IP address
-    //for now we will just print the IP address
-    client = TransferClient(host: ip);
+    final device = _discoveredDevices.values
+        .where((d) => d.host == ip)
+        .firstOrNull;
+    client = TransferClient(
+      host: ip,
+      port: device?.port ?? 5050,
+      alternateHosts: device?.addresses ?? const [],
+    );
     await client.connect();
     _connections[ip] = client;
   }
@@ -111,48 +122,19 @@ class Core {
 
   //6-establish a server on the LAN to listen for incoming connections
   Future<void> establishServer() async {
-    //this function will establish a server on the LAN to listen for incoming connections
-    if (_server != null) await closeServer(); // idempotent on retry
-
-    final docsDir = await getApplicationDocumentsDirectory();
-    final saveDir = Directory('${docsDir.path}/LanLink');
-    if (!await saveDir.exists()) await saveDir.create(recursive: true);
-
-    final server = TransferServer(saveDirectory: saveDir);
-    await server.start();
-    _server = server;
-
-    // advertise this device over mDNS so a peer's discoverDevices() finds it
-    final broadcast = BonsoirBroadcast(
-      service: BonsoirService(
-        name: '${Platform.localHostname}-lanlink',
-        type: kServiceType,
-        port: server.port,
-      ),
-    );
-    await broadcast.initialize();
-    await broadcast.start();
-    _broadcast = broadcast;
+    await _receiver.start();
   }
 
   //7-live status of this device's receive server: waiting for a peer, a transfer
   //coming in, or a transfer just completed. A failed transfer should reach the
   //UI as a Stream error rather than as a status value.
   Stream<ReceiveStatus> receiveStatusStream() {
-    final server = _server;
-    if (server == null) {
-      throw StateError('Server not started — call establishServer() first.');
-    }
-    return server.statusStream;
+    return _receiver.statusStream;
   }
 
   //8-close the server on the LAN
   Future<void> closeServer() async {
-    //this function will close the server on the LAN
-    await _broadcast?.stop();
-    _broadcast = null;
-    await _server?.dispose();
-    _server = null;
+    await _receiver.stop();
   }
 
   //9- show received files
@@ -160,26 +142,15 @@ class Core {
     final docsDir = await getApplicationDocumentsDirectory();
     final saveDir = Directory('${docsDir.path}/LanLink');
     if (!await saveDir.exists()) return [];
-    return saveDir.list().toList();
+    return saveDir
+        .list(followLinks: false)
+        .where((entry) => entry is File)
+        .toList();
   }
 
   //open a received file
   Future<void> openReceivedFile(String filePath) async {
-    final file = File(filePath);
-    if (!await file.exists()) {
-      throw FileSystemException('File not found', filePath);
-    }
-    if (Platform.isMacOS) {
-      await Process.start('open', [filePath]);
-    } else if (Platform.isLinux) {
-      await Process.start('xdg-open', [filePath]);
-    } else if (Platform.isWindows) {
-      // rundll32 is a real exe, so the path is passed as a clean argv entry —
-      // no cmd.exe re-quoting to break on names with spaces/dots (e.g. "9. Learning.pdf").
-      await Process.start('rundll32', ['url.dll,FileProtocolHandler', filePath]);
-    } else {
-      throw UnsupportedError('Opening files is not supported on this platform.');
-    }
+    await FileOpener.open(filePath);
   }
 
   //10- delete a received file

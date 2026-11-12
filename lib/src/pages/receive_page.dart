@@ -21,6 +21,7 @@ class _ReceivePageState extends State<ReceivePage> {
   late Future<void> _serverStartFuture;
   StreamSubscription<ReceiveStatus>? _statusSub;
   bool _torndown = false;
+  Future<void>? _teardownFuture;
 
   ReceiveStatus _liveStatus = ReceiveStatus.waiting;
   Object? _transferError;
@@ -34,25 +35,28 @@ class _ReceivePageState extends State<ReceivePage> {
   }
 
   Future<void> _startReceiving() async {
+    // Seed before listening starts, so files arriving during startup stay new.
+    _knownPaths = (await widget.core.showReceivedFiles())
+        .map((f) => f.path)
+        .toSet();
+    if (_torndown || !mounted) return;
     await widget.core.establishServer();
-    // seed with what's already there so only files that arrive THIS session
-    // are treated as new
-    _knownPaths = (await widget.core.showReceivedFiles()).map((f) => f.path).toSet();
-    if (!mounted) return;
+    if (_torndown || !mounted) return;
     _statusSub = widget.core.receiveStatusStream().listen(
-          _handleStatus,
-          onError: (e) {
-            if (mounted) setState(() => _transferError = e);
-          },
-        );
+      _handleStatus,
+      onError: (e) {
+        if (mounted && !_torndown) setState(() => _transferError = e);
+      },
+    );
   }
 
   // `completed` is intercepted here rather than rendered directly: it has no
   // file identity of its own, so we re-list via Core to find what's new, then
   // drop straight back to "waiting" instead of dead-ending on "File received".
   void _handleStatus(ReceiveStatus status) {
+    if (_torndown || !mounted) return;
     if (status == ReceiveStatus.completed) {
-      _onCompleted();
+      unawaited(_onCompleted());
     } else if (mounted) {
       setState(() {
         _liveStatus = status;
@@ -62,10 +66,16 @@ class _ReceivePageState extends State<ReceivePage> {
   }
 
   Future<void> _onCompleted() async {
-    final files = await widget.core.showReceivedFiles();
+    List<FileSystemEntity> files;
+    try {
+      files = await widget.core.showReceivedFiles();
+    } catch (e) {
+      if (mounted && !_torndown) setState(() => _transferError = e);
+      return;
+    }
     final newOnes = files.where((f) => !_knownPaths.contains(f.path)).toList();
     _knownPaths = files.map((f) => f.path).toSet();
-    if (!mounted) return;
+    if (!mounted || _torndown) return;
     setState(() {
       _sessionFiles.insertAll(0, newOnes);
       _liveStatus = ReceiveStatus.waiting;
@@ -75,23 +85,38 @@ class _ReceivePageState extends State<ReceivePage> {
 
   @override
   void dispose() {
-    _statusSub?.cancel();
-    _teardown();
+    unawaited(
+      _teardown().catchError((Object e) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: e,
+            library: 'LANLink receiver teardown',
+          ),
+        );
+      }),
+    );
     super.dispose();
   }
 
-  Future<void> _teardown() async {
-    if (_torndown) return;
+  Future<void> _teardown() {
     _torndown = true;
-    await widget.core.closeServer();
+    return _teardownFuture ??= Future.wait([
+      _statusSub?.cancel() ?? Future<void>.value(),
+      widget.core.closeServer(),
+    ]).then((_) {});
   }
 
   Future<void> _stopReceiving() async {
-    await _teardown();
-    if (mounted) Navigator.pop(context);
+    try {
+      await _teardown();
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) setState(() => _transferError = e);
+    }
   }
 
   void _retryStart() {
+    if (_torndown) return;
     _statusSub?.cancel();
     _statusSub = null;
     setState(() {
@@ -107,9 +132,9 @@ class _ReceivePageState extends State<ReceivePage> {
       await widget.core.openReceivedFile(file.path);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Couldn't open file: $e")),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text("Couldn't open file: $e")));
       }
     }
   }
@@ -149,10 +174,17 @@ class _ReceivePageState extends State<ReceivePage> {
 
           if (snapshot.hasError) {
             return StatusView(
-              graphic: const Icon(Icons.error_outline, size: 56, color: Colors.redAccent),
+              graphic: const Icon(
+                Icons.error_outline,
+                size: 56,
+                color: Colors.redAccent,
+              ),
               title: "Couldn't start receiving",
               message: '${snapshot.error}',
-              action: FilledButton(onPressed: _retryStart, child: const Text('Retry')),
+              action: FilledButton(
+                onPressed: _retryStart,
+                child: const Text('Retry'),
+              ),
             );
           }
 
@@ -161,24 +193,35 @@ class _ReceivePageState extends State<ReceivePage> {
               Expanded(
                 child: _transferError != null
                     ? StatusView(
-                        graphic: const Icon(Icons.error_outline, size: 56, color: Colors.redAccent),
+                        graphic: const Icon(
+                          Icons.error_outline,
+                          size: 56,
+                          color: Colors.redAccent,
+                        ),
                         title: 'Transfer failed',
                         message: '$_transferError',
                       )
                     : switch (_liveStatus) {
                         ReceiveStatus.incoming => const StatusView(
-                            graphic: SizedBox(
-                              width: 40,
-                              height: 40,
-                              child: CircularProgressIndicator(color: AppColors.primaryBlue),
+                          graphic: SizedBox(
+                            width: 40,
+                            height: 40,
+                            child: CircularProgressIndicator(
+                              color: AppColors.primaryBlue,
                             ),
-                            title: 'Receiving file…',
                           ),
-                        ReceiveStatus.waiting || ReceiveStatus.completed => const StatusView(
-                            graphic: AppLogo(variant: AppLogoVariant.mark, height: 64),
-                            title: 'Waiting for a device to send a file',
-                            message: 'This device is discoverable to others in Send mode.',
+                          title: 'Receiving file…',
+                        ),
+                        ReceiveStatus.waiting ||
+                        ReceiveStatus.completed => const StatusView(
+                          graphic: AppLogo(
+                            variant: AppLogoVariant.mark,
+                            height: 64,
                           ),
+                          title: 'Waiting for a device to send a file',
+                          message:
+                              'This device is discoverable to others in Send mode.',
+                        ),
                       },
               ),
               if (_sessionFiles.isNotEmpty)
@@ -193,7 +236,8 @@ class _ReceivePageState extends State<ReceivePage> {
                           alignment: Alignment.centerLeft,
                           child: Text(
                             'Received this session',
-                            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                            style: Theme.of(context).textTheme.labelLarge
+                                ?.copyWith(
                                   color: AppColors.navy.withValues(alpha: 0.6),
                                 ),
                           ),
@@ -208,7 +252,10 @@ class _ReceivePageState extends State<ReceivePage> {
                             final name = Uri.file(file.path).pathSegments.last;
                             return ListTile(
                               dense: true,
-                              leading: const Icon(Icons.check_circle, color: AppColors.primaryBlue),
+                              leading: const Icon(
+                                Icons.check_circle,
+                                color: AppColors.primaryBlue,
+                              ),
                               title: Text(name),
                               onTap: () => _openFile(file),
                             );

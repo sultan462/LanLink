@@ -1,204 +1,258 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
-import 'protocol.dart'; // for kHeaderSize
+import 'protocol.dart';
+import 'received_file.dart';
 import '../model/ReceiveStatus.dart';
 
-/// The TRANSPORT shell for the listening side. Owns the ServerSocket and the
-/// per-connection lifecycle, writes incoming files into [saveDirectory], and
-/// publishes progress as a status stream.
-///
-/// Framing knowledge stays in protocol.dart; this file only ORCHESTRATES modes
-/// (framed metadata -> raw file bytes) on top of it.
 class TransferServer {
   final int port;
   final Directory saveDirectory;
-
+  final Duration metadataTimeout;
+  final Duration bodyTimeout;
+  final ReceivedFile Function(Directory, String) _createFile;
   ServerSocket? _serverSocket;
-
-  // broadcast so multiple listeners (e.g. UI + logging) can watch; a failed
-  // transfer is delivered as a stream ERROR, never as a status value.
+  Future<void>? _starting;
+  Future<void>? _stopping;
+  Future<void>? _disposing;
+  bool _accepting = false;
+  bool _disposed = false;
+  final Set<_ReceiveConnection> _connections = {};
   final StreamController<ReceiveStatus> _status =
       StreamController<ReceiveStatus>.broadcast();
 
-  TransferServer({required this.saveDirectory, this.port = 5050});
+  TransferServer({
+    required this.saveDirectory,
+    this.port = 5050,
+    this.metadataTimeout = kMetadataTimeout,
+    this.bodyTimeout = const Duration(seconds: 30),
+    ReceivedFile Function(Directory, String)? createFile,
+  }) : _createFile = createFile ?? ReceivedFile.new;
 
-  /// What `Core.receiveStatusStream()` forwards to the UI.
   Stream<ReceiveStatus> get statusStream => _status.stream;
+  int get boundPort => _serverSocket?.port ?? port;
 
-  Future<void> start() async {
-    // anyIPv4 == 0.0.0.0: listen on EVERY interface so LAN peers can reach us,
-    // not just this machine. (SO_REUSEADDR is set by the Dart VM by default.)
-    _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-    _status.add(ReceiveStatus.waiting);
+  Future<void> start() {
+    if (_disposed) return Future.error(StateError('Receiver is disposed'));
+    if (_stopping != null) {
+      return Future.error(StateError('Receiver is stopping'));
+    }
+    if (_starting != null) return _starting!;
+    if (_serverSocket != null) return Future.value();
+    _accepting = true;
+    return _starting = _start();
+  }
 
-    _serverSocket!.listen(
-      _handleConnection,
-      onError: (e, st) =>
-          _status.addError(e, st), // listen-socket level failure
+  Future<void> _start() async {
+    try {
+      final server = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+      if (!_accepting) {
+        await server.close();
+        return;
+      }
+      _serverSocket = server;
+      _status.add(ReceiveStatus.waiting);
+      server.listen(
+        _handleConnection,
+        onError: (Object e, StackTrace st) {
+          if (_accepting) _status.addError(e, st);
+        },
+      );
+    } finally {
+      _starting = null;
+    }
+  }
+
+  void _handleConnection(Socket socket) {
+    if (!_accepting) {
+      socket.destroy();
+      return;
+    }
+    final connection = _ReceiveConnection(
+      socket,
+      saveDirectory,
+      _status,
+      metadataTimeout,
+      bodyTimeout,
+      _createFile,
+    );
+    _connections.add(connection);
+    unawaited(
+      connection.run().whenComplete(() => _connections.remove(connection)),
     );
   }
 
-  void _handleConnection(Socket client) {
-    // One receive context per connection: its own buffer + mode state. Two peers'
-    // byte streams must never share framing state, or their bytes interleave.
-    _ReceiveConnection(
-      socket: client,
-      saveDirectory: saveDirectory,
-      status: _status,
-    ).start();
+  Future<void> stop() {
+    _accepting = false;
+    for (final connection in _connections) {
+      connection.cancel();
+    }
+    return _stopping ??= _stop();
   }
 
-  /// Stop accepting connections and release the port. Keeps the status stream
-  /// alive so the server can be restarted; use [dispose] to tear it down fully.
-  Future<void> stop() async {
-    await _serverSocket?.close();
-    _serverSocket = null;
+  Future<void> _stop() async {
+    try {
+      // Binding may finish after stop was requested; _start closes that socket.
+      try {
+        await _starting;
+      } catch (_) {
+        // The caller of start receives its startup failure.
+      }
+      await _serverSocket?.close();
+      _serverSocket = null;
+      await Future.wait(_connections.map((c) => c.done));
+    } finally {
+      _stopping = null;
+    }
   }
 
-  Future<void> dispose() async {
+  Future<void> dispose() {
+    _disposed = true;
+    return _disposing ??= _dispose();
+  }
+
+  Future<void> _dispose() async {
     await stop();
     await _status.close();
   }
 }
 
-/// Handles ONE incoming connection.
-///
-/// The state machine: a connection begins in FRAMED mode, reading a single
-/// metadata frame ({name, size}) in the shared wire format. Once that frame is
-/// complete it flips to RAW mode and streams exactly `size` bytes straight to a
-/// file on disk, then flips back for the next file. All byte handling goes
-/// through ONE buffer and ONE drain loop, which is what makes a chunk that
-/// crosses the boundary (in either direction) just work.
 class _ReceiveConnection {
   final Socket socket;
-  final Directory saveDirectory;
+  final Directory directory;
   final StreamController<ReceiveStatus> status;
+  final Duration metadataTimeout;
+  final Duration bodyTimeout;
+  final ReceivedFile Function(Directory, String) createFile;
+  final Completer<void> _done = Completer();
+  late final TransferReader _reader = TransferReader(socket);
+  bool _cancelled = false;
+  ReceivedFile? _file;
+  int? _id;
 
-  // the single source of truth for unconsumed bytes on this connection
-  final List<int> _buffer = [];
+  _ReceiveConnection(
+    this.socket,
+    this.directory,
+    this.status,
+    this.metadataTimeout,
+    this.bodyTimeout,
+    this.createFile,
+  );
 
-  // mode state
-  bool _receivingFile = false;
-  IOSink? _sink;
-  int _bytesRemaining = 0;
+  Future<void> get done => _done.future;
 
-  _ReceiveConnection({
-    required this.socket,
-    required this.saveDirectory,
-    required this.status,
-  });
+  void cancel() {
+    _cancelled = true;
+    socket.destroy();
+    unawaited(_reader.cancel());
+  }
 
-  void start() => unawaited(_run());
+  void _checkCancelled() {
+    if (_cancelled) throw const TransferException('Reception cancelled');
+  }
 
-  Future<void> _run() async {
+  Future<void> _reply(Map<String, dynamic> message) async {
+    socket.add(
+      MessageProtocol.encode(
+        jsonEncode({'protocol': kProtocolVersion, ...message}),
+      ),
+    );
+    await socket.flush().timeout(metadataTimeout);
+  }
+
+  Future<void> run() async {
+    // Observe socket write-side errors from the moment the connection exists.
+    unawaited(
+      socket.done.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+    );
+    Object? failure;
+    StackTrace? trace;
     try {
-      // `await for` (not .listen) so we can await disk flush/close INLINE and
-      // keep status events strictly ordered, even for tiny back-to-back files.
-      await for (final chunk in socket) {
-        _buffer.addAll(chunk);
-        await _drain();
-      }
-      // socket closed cleanly. If a file was still in flight, it was truncated.
-      if (_receivingFile) {
-        await _abort();
-        status.addError(
-          const SocketException('Connection closed mid-transfer'),
+      final hello = await _reader.readFrame(timeout: metadataTimeout);
+      _checkCancelled();
+      if (hello == null) return;
+      final handshake = MessageProtocol.decodeObject(hello);
+      if (handshake['protocol'] != kProtocolVersion ||
+          handshake['type'] != 'hello') {
+        throw const TransferException(
+          'Unsupported peer: LANLink protocol 2 required',
         );
       }
-    } catch (e, st) {
-      await _abort();
-      status.addError(e, st); // surface ANY failure as a stream error
-    } finally {
-      await socket.close(); // release our side — otherwise it lingers in CLOSE_WAIT
-    }
-  }
-
-  /// Consume as much of [_buffer] as the current mode allows, looping so that a
-  /// single chunk holding [file tail][next metadata][next file head] is fully
-  /// processed in one pass.
-  Future<void> _drain() async {
-    while (true) {
-      if (_receivingFile) {
-        if (_buffer.isEmpty) return;
-
-        // take only what THIS file still needs — never read into the next frame
-        final take = min(_buffer.length, _bytesRemaining);
-        _sink!.add(_buffer.sublist(0, take));
-        _buffer.removeRange(0, take);
-        _bytesRemaining -= take;
-
-        if (_bytesRemaining == 0) {
-          await _finishFile(); // flush+close+announce, ordered
-          // loop continues: whatever's left in _buffer is the NEXT metadata frame
-        } else {
-          return; // buffer drained, file still incomplete — wait for more bytes
+      await _reply({'type': 'ready'});
+      while (true) {
+        final message = await _reader.readFrame(timeout: metadataTimeout);
+        _checkCancelled();
+        if (message == null || message == kCloseWord) break;
+        final meta = MessageProtocol.decodeObject(message);
+        final size = meta['size'];
+        final id = meta['id'];
+        if (meta['protocol'] != kProtocolVersion ||
+            meta['type'] != 'file' ||
+            id is! int ||
+            id < 1 ||
+            size is! int ||
+            size < 0) {
+          throw const FormatException('Invalid file metadata');
         }
-      } else {
-        // FRAMED mode: peel ONE metadata frame. Header is a fixed kHeaderSize
-        // field carrying the body length as padded text (the protocol.dart format).
-        if (_buffer.length < kHeaderSize) return; // header not fully here yet
-
-        final header = utf8.decode(_buffer.sublist(0, kHeaderSize)).trim();
-        final metaLen = int.parse(header);
-
-        if (_buffer.length < kHeaderSize + metaLen) return; // body not all here
-
-        final metaBytes = _buffer.sublist(kHeaderSize, kHeaderSize + metaLen);
-        _buffer.removeRange(0, kHeaderSize + metaLen);
-
-        final message = utf8.decode(metaBytes);
-        if (message == kCloseWord) return; // peer is done — not a file frame
-
-        _beginFile(message);
-        // loop continues: remaining _buffer bytes are now FILE bytes (raw mode)
+        _id = id;
+        final name = ReceivedFile.validateName(meta['name']);
+        _file = createFile(directory, name);
+        status.add(ReceiveStatus.incoming);
+        await _file!.open();
+        _checkCancelled();
+        var remaining = size;
+        while (remaining > 0) {
+          final bytes = await _reader.readSome(remaining).timeout(bodyTimeout);
+          _checkCancelled();
+          if (bytes == null) {
+            throw const TransferException(
+              'Connection closed mid-transfer (truncated file)',
+            );
+          }
+          await _file!.write(bytes);
+          remaining -= bytes.length;
+        }
+        _checkCancelled();
+        final savedName = await _file!.commit(_checkCancelled);
+        await _file!.dispose();
+        _file = null;
+        status.add(ReceiveStatus.completed);
+        await _reply({'type': 'saved', 'id': _id, 'name': savedName});
+        _id = null;
       }
+    } catch (e, st) {
+      failure = e;
+      trace = st;
+    } finally {
+      try {
+        await _file?.dispose();
+      } catch (e, st) {
+        failure = TransferException(
+          '${failure ?? 'Transfer failed'}; cleanup failed: $e',
+        );
+        trace = st;
+      }
+      if (failure != null) {
+        status.addError(failure, trace);
+        if (!_cancelled) {
+          try {
+            await _reply({
+              'type': 'error',
+              'id': _id,
+              'message': '$failure'.substring(
+                0,
+                '$failure'.length.clamp(0, 2000),
+              ),
+            });
+          } catch (_) {
+            // The peer may already be gone. The local error is still reported.
+          }
+        }
+      }
+      socket.destroy();
+      await _reader.cancel();
+      _done.complete();
     }
-  }
-
-  void _beginFile(String metaJson) {
-    final meta = jsonDecode(metaJson) as Map<String, dynamic>;
-    final size = meta['size'] as int;
-
-    // SECURITY: never trust the sender's path. Take only the basename so a name
-    // like "../../etc/passwd" can't escape saveDirectory.
-    final rawName = (meta['name'] as String?) ?? 'received_file';
-    final safeName = Uri.file(rawName).pathSegments.last;
-    final dest = File('${saveDirectory.path}/$safeName');
-
-    _sink = dest.openWrite();
-    _bytesRemaining = size;
-    _receivingFile = true;
-    status.add(ReceiveStatus.incoming);
-    // size == 0 is handled naturally: the drain loop's raw branch takes 0 bytes,
-    // sees _bytesRemaining == 0, and finishes immediately.
-  }
-
-  Future<void> _finishFile() async {
-    final sink = _sink;
-    _sink = null;
-    _receivingFile = false;
-    _bytesRemaining = 0;
-
-    // flush+close FIRST so the file is fully on disk before we say "completed".
-    await sink?.flush();
-    await sink?.close();
-
-    status.add(ReceiveStatus.completed);
-    // stays "completed" until the next file's _beginFile() moves it to
-    // "incoming" — re-adding "waiting" here instantly overwrites it, so the
-    // UI never gets a frame where the user can see the file arrived.
-  }
-
-  Future<void> _abort() async {
-    final sink = _sink;
-    _sink = null;
-    _receivingFile = false;
-    _bytesRemaining = 0;
-    _buffer.clear();
-    await sink?.close();
-    // (optional) delete the partial file here so half-received data isn't left behind
   }
 }
